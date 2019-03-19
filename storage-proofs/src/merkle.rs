@@ -5,17 +5,29 @@ use std::marker::PhantomData;
 // Reexport here, so we don't depend on merkle_light directly in other places.
 use merkle_light::hash::Algorithm;
 use merkle_light::merkle;
-use merkle_light::merkle::MmapStore;
 use merkle_light::merkle::VecStore;
 use merkle_light::proof;
 use pairing::bls12_381::Fr;
 
+use memmap::MmapMut;
+use merkle_light::merkle::{Element, Store};
+use rand;
+use std::env;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
+use std::ops;
+use std::path::PathBuf;
+use tempfile::tempfile;
+
 use crate::hasher::{Domain, Hasher};
+use crate::SP_LOG;
 
 // `mmap`ed `MerkleTree` (replacing the previously `Vec`-backed
 // `MerkleTree`, now encapsulated in `merkle::VecStore` and exposed
 // as `VecMerkleTree`).
-pub type MerkleTree<T, A> = merkle::MerkleTree<T, A, MmapStore<T>>;
+pub type MerkleTree<T, A> = merkle::MerkleTree<T, A, DiskMmapStore<T>>;
 pub type VecMerkleTree<T, A> = merkle::MerkleTree<T, A, VecStore<T>>;
 
 /// Representation of a merkle proof.
@@ -151,6 +163,168 @@ fn path_index<T: Domain>(path: &[(T, bool)]) -> usize {
     path.iter().rev().fold(0, |acc, (_, is_right)| {
         (acc << 1) + if *is_right { 1 } else { 0 }
     })
+}
+
+// File-mapping version of `MmapStore`. `INTERNAL_TREE_NAME` is used internally
+// to set the file name (to label trees with the number of the corresponding
+// layer they belong to) and `DISK_BACKED_MMAP_TREE_DIR` is set externally by
+// the user to define the directory where the files will be created. (If one
+// of these is not set we just create a random file that will be removed after
+// `DiskMmapStore` is dropped).
+//
+// FIXME: Copied from `MmapStore`, needs to be integrated into
+//  `merkle_light::merkle`. The only difference is in the `Store::new()`
+//  method which creates a file mapping (instead of an anonymous one).
+//
+// FIXME: `DISK_BACKED_MMAP_TREE_DIR` is being manually set in local
+//  tests.
+#[derive(Debug)]
+pub struct DiskMmapStore<E: Element> {
+    store: MmapMut,
+    len: usize,
+    _e: PhantomData<E>,
+    file: File,
+    // We need to save the `File` in case we're creating a `tempfile()`
+    // otherwise it will get cleaned after we return from `new()`.
+    // FIXME: Check this (at least that was the case for `tempdir()`).
+}
+
+impl<E: Element> ops::Deref for DiskMmapStore<E> {
+    type Target = [E];
+
+    fn deref(&self) -> &Self::Target {
+        unimplemented!()
+    }
+}
+
+impl<E: Element> Store<E> for DiskMmapStore<E> {
+    #[allow(unsafe_code)]
+    fn new(size: usize) -> Self {
+        let byte_len = E::byte_len() * size;
+
+        let file: File = if env::var("INTERNAL_TREE_NAME").is_ok()
+            && env::var("DISK_BACKED_MMAP_TREE_DIR").is_ok()
+        {
+            let trees_dir = PathBuf::from(env::var("DISK_BACKED_MMAP_TREE_DIR").unwrap());
+
+            // Try to create `trees_dir`, ignore the error if `AlreadyExists`.
+            if let Some(create_error) = fs::create_dir(&trees_dir).err() {
+                if create_error.kind() != io::ErrorKind::AlreadyExists {
+                    panic!(create_error);
+                }
+            }
+
+            let tree_name = env::var("INTERNAL_TREE_NAME").unwrap();
+
+            let tree_name = format!("{}-{}", tree_name, rand::random::<u32>());
+            // FIXME: The user of `DISK_BACKED_MMAP_TREE_DIR` should figure out
+            // how to manage this directory, for now we create every file with
+            // a different random number, the problem being that tests now do
+            // replications many times in the same run so they end up reusing
+            // the same files with invalid (old) data.
+
+            let tree_path = &trees_dir.join(&tree_name);
+
+            info!(SP_LOG, "creating tree mmap-file"; "path" => &tree_path.to_str());
+
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&tree_path)
+                .unwrap()
+        } else {
+            // We don't know which layer this is (`INTERNAL_TREE_NAME`) or we
+            // don't know where to save it (`DISK_BACKED_MMAP_TREE_DIR`), just
+            // create *any* temporary file.
+            tempfile().unwrap()
+        };
+
+        file.set_len(byte_len as u64).unwrap();
+
+        DiskMmapStore {
+            store: unsafe { MmapMut::map_mut(&file).unwrap() },
+            len: 0,
+            _e: Default::default(),
+            file,
+        }
+    }
+
+    fn new_from_slice(size: usize, data: &[u8]) -> Self {
+        assert_eq!(data.len() % E::byte_len(), 0);
+
+        let mut res = Self::new(size);
+
+        let end = data.len();
+        res.store[..end].copy_from_slice(data);
+        res.len = data.len() / E::byte_len();
+
+        res
+    }
+
+    fn write_at(&mut self, el: E, i: usize) {
+        let b = E::byte_len();
+        self.store[i * b..(i + 1) * b].copy_from_slice(el.as_ref());
+        self.len += 1;
+    }
+
+    fn read_at(&self, i: usize) -> E {
+        let b = E::byte_len();
+        let start = i * b;
+        let end = (i + 1) * b;
+        let len = self.len * b;
+        assert!(start < len, "start out of range {} >= {}", start, len);
+        assert!(end <= len, "end out of range {} > {}", end, len);
+
+        E::from_slice(&self.store[start..end])
+    }
+
+    fn read_range(&self, r: ops::Range<usize>) -> Vec<E> {
+        let b = E::byte_len();
+        let start = r.start * b;
+        let end = r.end * b;
+        let len = self.len * b;
+        assert!(start < len, "start out of range {} >= {}", start, len);
+        assert!(end <= len, "end out of range {} > {}", end, len);
+
+        self.store[start..end]
+            .chunks(b)
+            .map(E::from_slice)
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, el: E) {
+        let l = self.len;
+        assert!(
+            (l + 1) * E::byte_len() <= self.store.len(),
+            "not enough space"
+        );
+
+        self.write_at(el, l);
+    }
+}
+
+impl<E: Element> AsRef<[u8]> for DiskMmapStore<E> {
+    fn as_ref(&self) -> &[u8] {
+        &self.store
+    }
+}
+
+impl<E: Element> Clone for DiskMmapStore<E> {
+    fn clone(&self) -> DiskMmapStore<E> {
+        DiskMmapStore::new_from_slice(
+            self.store.len() / E::byte_len(),
+            &self.store[..(self.len() * E::byte_len())],
+        )
+    }
 }
 
 #[cfg(test)]

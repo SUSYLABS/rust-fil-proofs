@@ -1,4 +1,5 @@
 use std::cmp::{max, min};
+use std::env;
 use std::marker::PhantomData;
 use std::sync::mpsc::channel;
 
@@ -425,6 +426,12 @@ pub trait Layers {
                         transfer_tx.send(current_graph.clone()).unwrap();
 
                         let thread = scope.spawn(move |_| {
+                            // Set the path that the file-mapping inside `MerkleTree`
+                            // will use (not sure how well setting env.vars works
+                            // with threads but this is just a temporal workaround
+                            // anyway).
+                            env::set_var("INTERNAL_TREE_NAME", format!("tree-{}", layer));
+
                             // If we panic anywhere in this closure, thread.join() below will receive an error —
                             // so it is safe to unwrap.
                             let graph = transfer_rx.recv().unwrap();
