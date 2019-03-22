@@ -22,9 +22,11 @@ m = [ 6 ]
 
 [zigzag]
 challenges = [ 1 ]
-size = ["1 KiB"]
+size = ["1 MiB"]
 hasher = ["pedersen"]
 command = "--groth"
 sloth  = [ 0 ]
 m = [ 5 ]
-expansion = [ 6 ]
+expansion = [ 8 ]
+layers = [ 10 ]
+partitions = [ 1 ]
